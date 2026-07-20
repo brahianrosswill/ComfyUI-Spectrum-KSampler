@@ -204,7 +204,12 @@ def setup_dcw_calibrator(
         return None
 
     dm = model_clone.model.diffusion_model
-    device = next(dm.parameters()).device
+    # The patcher's declared device, NOT the DiT's parameter device: under
+    # Dynamic VRAM (comfy_aimdo) the params are meta shells reporting cpu while
+    # the real bytes live in the vbar, so reading `.device` off them would load
+    # the calibrator on cpu and mismatch every tensor it later touches.
+    # Matches the `m.load_device` idiom in nodes.py / spectrum.py.
+    device = model_clone.load_device
     dtype = model_clone.model.get_dtype_inference()
 
     try:

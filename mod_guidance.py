@@ -351,22 +351,29 @@ class ModGuidanceState:
         self.qneg_pooled: Optional[torch.Tensor] = None  # quality-neg baseline
 
     def _encode_pool(self, raw, t5_ids, t5_weights, device, dtype):
-        # The DiT's llm_adapter can live on a different device than the sampling
-        # `device` — comfy keeps it CPU-resident here even when the main blocks
-        # are GPU-loaded, so feeding cuda ids to a CPU embedding throws an
-        # index_select device mismatch. Run the adapter on its own parameter
-        # device, then return the pooled result on `device` so the projection
-        # MLP (loaded on `device`) matches.
-        adapter_device = next(self.dit.llm_adapter.parameters()).device
+        # Run on the SAMPLING device, never on the adapter's parameter device.
+        # Every weight-bearing submodule of LLMAdapter is a comfy `operations.*`
+        # module, so each casts its own weight to the input's device — this is
+        # byte-for-byte the call core makes in `model_base.extra_conds`, which
+        # also passes the sampling device down rather than reading it off a
+        # parameter.
+        #
+        # Do NOT reintroduce `next(dit.llm_adapter.parameters()).device` here.
+        # Under Dynamic VRAM (comfy_aimdo) the params are meta shells whose
+        # `.device` reports cpu while the real bytes live in the vbar, so that
+        # sent us into the CPU escape hatch in `ops.py::cast_bias_weight`
+        # ("vbar doesn't support CPU weights, but some custom nodes have weird
+        # paths"). That path calls `materialize_meta_param`, which permanently
+        # swaps the module's weight for a freshly allocated ZERO tensor —
+        # silently corrupting the pooled projections on run 1 and desyncing the
+        # module from its vbar bookkeeping, so run 2 dies with
+        # "RuntimeError: Fault failed: 2" (VBAR_FAULT_ERROR) when core faults
+        # llm_adapter.embed back in.
         adapted = self.dit.preprocess_text_embeds(
-            raw.unsqueeze(0).to(device=adapter_device, dtype=dtype),
-            t5_ids.unsqueeze(0).to(device=adapter_device)
-            if t5_ids is not None
-            else None,
+            raw.unsqueeze(0).to(device=device, dtype=dtype),
+            t5_ids.unsqueeze(0).to(device=device) if t5_ids is not None else None,
             t5xxl_weights=(
-                t5_weights.unsqueeze(0)
-                .unsqueeze(-1)
-                .to(device=adapter_device, dtype=dtype)
+                t5_weights.unsqueeze(0).unsqueeze(-1).to(device=device, dtype=dtype)
                 if t5_weights is not None
                 else None
             ),
