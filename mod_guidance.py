@@ -26,6 +26,12 @@ from library.inference.corrections.mod_guidance_core import (
     project_pooled,
 )
 
+from .mod_guidance_layouts import (
+    SCHEDULE_BASIS_ANIMA_BASE_28,
+    SCHEDULE_BASIS_NATIVE,
+    resolve_source_anchor_schedule,
+)
+
 logger = logging.getLogger(__name__)
 
 # Printed once at import (ComfyUI server startup). If you don't see this line in
@@ -308,6 +314,9 @@ class ModGuidanceState:
         taper: int = 0,
         taper_scale: float = 0.25,
         final_w: float = 0.0,
+        schedule_basis: str = SCHEDULE_BASIS_NATIVE,
+        model_family: str = "",
+        model_channels: Optional[int] = None,
     ):
         self.adapter_path = adapter_path
         self.w = w
@@ -335,6 +344,10 @@ class ModGuidanceState:
         self.taper = int(taper)
         self.taper_scale = float(taper_scale)
         self.final_w = float(final_w)
+        self.schedule_basis = str(schedule_basis)
+        self.model_family = str(model_family or "")
+        self.model_channels = model_channels
+        self.schedule_layout = SCHEDULE_BASIS_NATIVE
         # Computed lazily on first forward when DiT is on GPU
         self.cond_combined: Optional[torch.Tensor] = None  # (1, C) base proj_pos
         self.uncond_combined: Optional[torch.Tensor] = None  # (1, C) base proj_neg
@@ -443,19 +456,54 @@ class ModGuidanceState:
             f"Mod guidance: precomputed "
             f"(w={self.w}, start={self.start_layer}, end={self.end_layer}, "
             f"taper={self.taper}, taper_scale={self.taper_scale}, "
-            f"final_w={self.final_w}, sigma_film={self.has_film})"
+            f"final_w={self.final_w}, layout={self.schedule_layout}, "
+            f"sigma_film={self.has_film})"
         )
 
     def _build_schedule(self):
-        # Shared per-block w(ℓ) profile (single source with the library).
+        target_block_count = len(self.dit.blocks)
+        if self.schedule_basis == SCHEDULE_BASIS_ANIMA_BASE_28:
+            source_schedule = build_block_schedule(
+                28,
+                w=self.w,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                taper=self.taper,
+                taper_scale=self.taper_scale,
+            )
+            resolved, layout_name = resolve_source_anchor_schedule(
+                source_schedule,
+                model_family=self.model_family,
+                model_channels=self.model_channels,
+                target_block_count=target_block_count,
+            )
+            if resolved is not None:
+                self.per_block_schedule = resolved
+                self.schedule_layout = str(layout_name)
+                return
+            logger.warning(
+                "[mod-guidance] no verified block expansion layout for "
+                "family=%r, channels=%r, blocks=28->%d; preserving native-index "
+                "profile behavior for compatibility.",
+                self.model_family,
+                self.model_channels,
+                target_block_count,
+            )
+        elif self.schedule_basis != SCHEDULE_BASIS_NATIVE:
+            raise ValueError(
+                f"Unsupported modulation-guidance schedule basis: {self.schedule_basis}"
+            )
+
+        # Shared native-index w(ℓ) profile (single source with the library).
         self.per_block_schedule = build_block_schedule(
-            len(self.dit.blocks),
+            target_block_count,
             w=self.w,
             start_layer=self.start_layer,
             end_layer=self.end_layer,
             taper=self.taper,
             taper_scale=self.taper_scale,
         )
+        self.schedule_layout = f"native-{target_block_count}"
 
 
 def _t_emb_forward_hook(module, input, output):
@@ -719,6 +767,7 @@ def setup_mod_guidance(
     taper: int = 0,
     taper_scale: float = 0.25,
     final_w: float = 0.0,
+    schedule_basis: str = SCHEDULE_BASIS_NATIVE,
 ):
     """Capture raw tensors for quality tags / positive / negative, install the
     t_emb / per-block / final-layer hooks, and register the APPLY_MODEL wrapper.
@@ -739,6 +788,8 @@ def setup_mod_guidance(
         taper:        number of late slots inside [start, end) to scale by `taper_scale`.
         taper_scale:  multiplier on tapered slots (default 0.25).
         final_w:      `w` applied at `final_layer` (default 0 = don't disturb).
+        schedule_basis: `native` for live block indices, or `anima_base_28` for
+                        manifest-backed source-block remapping on known expansions.
     """
     adapter_path = _resolve_adapter_path(adapter_name)
 
@@ -753,6 +804,13 @@ def setup_mod_guidance(
             f"Adapter output dim ({adapter_cpu['0.weight'].shape[0]}) "
             f"!= model_channels ({model_channels})"
         )
+    model_config = getattr(model_clone.model, "model_config", None)
+    unet_config = getattr(model_config, "unet_config", None)
+    model_family = (
+        str(unet_config.get("image_model") or "")
+        if isinstance(unet_config, dict)
+        else ""
+    )
 
     # Encode quality tags via CLIP (same text encoder the sampler uses)
     tokens = clip.tokenize(quality_tags)
@@ -809,6 +867,9 @@ def setup_mod_guidance(
         taper=taper,
         taper_scale=taper_scale,
         final_w=final_w,
+        schedule_basis=schedule_basis,
+        model_family=model_family,
+        model_channels=int(model_channels),
     )
 
     # Install the t_emb forward hook exactly once per DiT instance. Module-level
