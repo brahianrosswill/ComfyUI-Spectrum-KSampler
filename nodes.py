@@ -14,6 +14,10 @@ from .dcw import install_dcw
 from .dcw_calibrator import setup_dcw_calibrator
 from .fsg import FSGCalibrator, fsg_step_indices, install_cfgpp, install_fsg
 from .mod_guidance import AUTO_ADAPTER_SENTINEL, setup_mod_guidance
+from .mod_guidance_layouts import (
+    SCHEDULE_BASIS_ANIMA_BASE_28,
+    SCHEDULE_BASIS_NATIVE,
+)
 from .smc_cfg import install_smc_cfg
 from .spectrum import COMPAT_POLICIES, apply_dit_spectrum_patch, spectrum_sample
 
@@ -70,19 +74,38 @@ _QUALITY_TAGS_INPUT = (
     },
 )
 
-# Per-block guidance profiles. Each maps to a fixed (w, start, end, taper, taper_scale, final_w)
-# tuple — see docs/mod-guidance.md for the naming + rationale.
+# Per-block guidance profiles. Step profiles retain their original Anima 28-block
+# calibration on verified expansions. Uniform and Advanced controls keep native
+# live-model indices for backward-compatible semantics.
 # end_layer = -1 means "all blocks" (resolved against num_blocks at setup time).
 MOD_W_PROFILE_OFF = "off"
 MOD_W_PROFILES = {
     "step_i8_skip27": dict(
-        w=3.0, start_layer=8, end_layer=27, taper=0, taper_scale=0.25, final_w=0.0
+        w=3.0,
+        start_layer=8,
+        end_layer=27,
+        taper=0,
+        taper_scale=0.25,
+        final_w=0.0,
+        schedule_basis=SCHEDULE_BASIS_ANIMA_BASE_28,
     ),
     "step_i14": dict(
-        w=3.0, start_layer=14, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0
+        w=3.0,
+        start_layer=14,
+        end_layer=-1,
+        taper=0,
+        taper_scale=0.25,
+        final_w=0.0,
+        schedule_basis=SCHEDULE_BASIS_ANIMA_BASE_28,
     ),
     "uniform_w3": dict(
-        w=3.0, start_layer=0, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0
+        w=3.0,
+        start_layer=0,
+        end_layer=-1,
+        taper=0,
+        taper_scale=0.25,
+        final_w=0.0,
+        schedule_basis=SCHEDULE_BASIS_NATIVE,
     ),
 }
 DEFAULT_MOD_W_PROFILE = "step_i8_skip27"
@@ -119,11 +142,12 @@ _MOD_PROFILE_INPUTS = {
             "tooltip": (
                 "Per-block guidance schedule preset. "
                 "'off' disables modulation guidance entirely (no adapter download, no extra hook). "
-                "'step_i8_skip27' (default) protects early tonal-DC blocks 0–7 and the "
-                "final compensation block 27, applying w=3 to blocks 8–26 — best overall "
+                "'step_i8_skip27' (default) protects early tonal-DC source blocks 0–7 and "
+                "source block 27, applying w=3 to source blocks 8–26 — best overall "
                 "quality but can occasionally show minor anatomy drift on drift-prone LoRAs. "
-                "'step_i14' is the SAFE option: steers only from block 14 onward, reliably "
+                "'step_i14' is the SAFE option: steers only from source block 14 onward, reliably "
                 "stays inside the trained manifold at the cost of a slightly less expressive result. "
+                "Known depth-expanded Anima layouts remap both step profiles automatically. "
                 "'uniform_w3' recovers pre-0413 behavior (not recommended — prone to pink-collapse)."
             ),
         },
@@ -782,6 +806,7 @@ def _apply_mod_guidance(
     taper,
     taper_scale,
     final_w,
+    schedule_basis=SCHEDULE_BASIS_NATIVE,
 ):
     """Clone `model` and install the mod-guidance hook with explicit scalars."""
     m = model.clone()
@@ -799,6 +824,7 @@ def _apply_mod_guidance(
         taper=taper,
         taper_scale=taper_scale,
         final_w=final_w,
+        schedule_basis=schedule_basis,
     )
     return m
 
@@ -839,6 +865,7 @@ def _apply_mod_profile(
         taper=profile["taper"],
         taper_scale=profile["taper_scale"],
         final_w=profile["final_w"],
+        schedule_basis=profile["schedule_basis"],
     )
 
 
