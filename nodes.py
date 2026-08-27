@@ -1,6 +1,5 @@
 """ComfyUI node definitions for Spectrum inference acceleration."""
 
-import copy
 import json
 import logging
 import math
@@ -724,18 +723,6 @@ _FSG_INPUTS = {
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _clone_model_options(model):
-    """Copy model_options so model patch nodes do not mutate the input MODEL."""
-    try:
-        model.model_options = copy.deepcopy(model.model_options)
-    except Exception as e:
-        logger.warning(
-            "DiT model patch: deepcopy(model_options) failed (%s); using a shallow copy.",
-            e,
-        )
-        model.model_options = dict(model.model_options)
 
 
 def _missing_option_error(feature_name, missing, *, hint):
@@ -1500,8 +1487,12 @@ class DiTCFGFSGPatch:
                 "experimental plain-CFG substrate."
             )
 
+        # `ModelPatcher.clone()` already isolates `model_options` via
+        # `comfy.utils.deepcopy_list_dict` (container-only copy). Never layer a
+        # `copy.deepcopy` on top — `transformer_options` can carry state objects
+        # holding conditioning tensors and a reference to the DiT module, which
+        # a full deepcopy would duplicate in host RAM. See issue #8.
         m = model.clone()
-        _clone_model_options(m)
 
         if want_dcw:
             calibrator = None

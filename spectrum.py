@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import inspect
 import logging
 import math
@@ -1034,18 +1033,6 @@ def _require_dit_spectrum_components(model):
     return dit, model_sampling
 
 
-def _clone_model_options(model):
-    try:
-        model.model_options = copy.deepcopy(model.model_options)
-    except Exception as e:
-        logger.warning(
-            "DiT Spectrum Patch: deepcopy(model_options) failed (%s); using a "
-            "shallow copy for wrapper isolation.",
-            e,
-        )
-        model.model_options = dict(model.model_options)
-
-
 def _normalize_cond_or_uncond(args, batch_size: int):
     raw = args.get("cond_or_uncond", [0])
     if raw is None:
@@ -1167,8 +1154,14 @@ def apply_dit_spectrum_patch(
             f"(got history_size={history_size}, cheby_degree={cheby_degree})."
         )
 
+    # `ModelPatcher.clone()` already isolates `model_options` via
+    # `comfy.utils.deepcopy_list_dict`, which copies dict/list containers while
+    # preserving every other object by reference. Do NOT add a `copy.deepcopy`
+    # on top of it: `model_options["transformer_options"]` can hold state
+    # objects that reference conditioning tensors and the DiT module itself
+    # (e.g. `ModGuidanceState`), so a full deepcopy duplicates model-sized
+    # storage in host RAM. See issue #8.
     m = model.clone()
-    _clone_model_options(m)
     dit, model_sampling = _require_dit_spectrum_components(m)
 
     state = SpectrumState(
