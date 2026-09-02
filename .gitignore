@@ -1,2 +1,1 @@
-node.zip
-*.pyc
+Nothing needs to be added to .gitignore since only source files (.py) were modified and no build artifacts, dependencies, or temporary files were detected in the changes.

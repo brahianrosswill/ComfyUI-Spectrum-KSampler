@@ -1301,6 +1301,117 @@ def apply_dit_spectrum_patch(
     return m
 
 
+def apply_dit_xattn_boost_patch(
+    model,
+    xattn_boost: float = 1.0,
+    xattn_boost_band: float = 0.85,
+    xattn_boost_renorm: str = "img",
+    xattn_boost_renorm_frac: float = 0.5,
+    enabled: bool = True,
+):
+    """Return a MODEL clone patched with cross-attn boost only (no forecasting).
+    
+    This is a standalone patch that applies front-loaded cross-attention residual
+    gain to strengthen weak-tag adherence and relation bindings. It works with
+    any sampler (vanilla KSampler, Custom Sampler, etc.) and does not include
+    Spectrum forecasting.
+    
+    Args:
+        model: The base model to patch
+        xattn_boost: Boost λ (1.0 = off, ~1.5 mild, up to 3.0 strong)
+        xattn_boost_band: σ cutoff (boost fires at σ ≥ band)
+        xattn_boost_renorm: Norm matching mode ('off', 'tok', 'img')
+        xattn_boost_renorm_frac: Partial-correction exponent ρ
+        enabled: If False, returns the original model unchanged
+    """
+    if not enabled:
+        return model
+    
+    xattn_boost_active = xattn_boost is not None and not math.isclose(
+        float(xattn_boost), 1.0
+    )
+    
+    if not xattn_boost_active:
+        return model
+    
+    xattn_renorm_mode = str(xattn_boost_renorm or "off").lower()
+    if xattn_renorm_mode not in ("off", "tok", "img"):
+        logger.warning(
+            "Xattn boost: unknown renorm mode %r; using 'img'.",
+            xattn_boost_renorm,
+        )
+        xattn_renorm_mode = "img"
+    
+    m = model.clone()
+    dit = m.model.diffusion_model
+    
+    # Install the cross-attn gain patch
+    if not _ensure_xattn_gain_patch(dit):
+        logger.warning(
+            "Xattn boost: DiT has no blocks[*].cross_attn to patch; "
+            "returning unpatched model."
+        )
+        return m
+    
+    # Optionally install the norm-matched block patch
+    if xattn_renorm_mode != "off":
+        if not _ensure_xattn_block_patch(dit):
+            logger.warning(
+                "Xattn boost: falling back to raw gain (renorm unavailable)."
+            )
+            xattn_renorm_mode = "off"
+    
+    logger.info(
+        "Xattn boost active: λ=%.3g at σ ≥ %.3g, renorm=%s ρ=%.2g "
+        "(cond forward only, compile-safe buffer path).",
+        float(xattn_boost),
+        float(xattn_boost_band),
+        xattn_renorm_mode,
+        float(xattn_boost_renorm_frac),
+    )
+    
+    old_wrapper = m.model_options.get("model_function_wrapper")
+    model_options = m.model_options
+    
+    def xattn_boost_wrapper(apply_model, args):
+        input_x = args["input"]
+        timestep = args["timestep"]
+        c = args["c"]
+        
+        cond_or_uncond, valid_chunks = _normalize_cond_or_uncond(
+            args, input_x.shape[0]
+        )
+        sigma_val = timestep.flatten()[0].item()
+        
+        # Arm the cross-attn boost for this forward
+        boost_armed = False
+        if xattn_boost_active:
+            boost_armed = _set_xattn_gain(
+                dit,
+                cond_or_uncond,
+                input_x.shape[0],
+                float(xattn_boost),
+                float(xattn_boost_band),
+                sigma_val,
+                renorm_mode=xattn_renorm_mode,
+                renorm_frac=float(xattn_boost_renorm_frac),
+            )
+        
+        try:
+            if old_wrapper is not None:
+                result = old_wrapper(apply_model, args)
+            else:
+                result = apply_model(input_x, timestep, **c)
+        finally:
+            if boost_armed:
+                _reset_xattn_gain(dit)
+        
+        return result
+    
+    m.set_model_unet_function_wrapper(xattn_boost_wrapper)
+    return m
+
+
 def spectrum_sample(
     model,
     seed,
